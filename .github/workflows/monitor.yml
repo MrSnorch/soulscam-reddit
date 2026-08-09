@@ -1,13 +1,15 @@
 name: Reddit Post Monitor
 
 on:
+  workflow_dispatch: {}   # запусти вручную один раз, чтобы стартовать цепочку
   schedule:
-    # каждые 6 часов
-    - cron: "0 */6 * * *"
-  workflow_dispatch: {}  # ручной запуск для теста
+    # подстраховка: если self-retrigger по какой-то причине не сработал,
+    # раз в сутки cron всё равно перезапустит цепочку
+    - cron: "0 0 * * *"
 
 permissions:
-  contents: write  # нужно, чтобы коммитить state.json обратно
+  contents: write   # коммитить state.json
+  actions: write    # нужно, чтобы скрипт мог сам вызвать следующий workflow_dispatch
 
 concurrency:
   group: reddit-monitor
@@ -16,6 +18,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 355  # чуть меньше 6 часов — запас на checkout/commit после цикла
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,14 +28,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run monitor
+      - name: Configure git identity (for in-loop commits)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run monitor (6h loop, checks every 5 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDDIT_USERNAMES: "SoulboundMMO,futuraszn"
+          RUN_DURATION_SECONDS: 21000   # ~5ч50м — оставляем запас до лимита джобы
+          CHECK_INTERVAL_SECONDS: 300   # 5 минут
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python monitor.py
 
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
