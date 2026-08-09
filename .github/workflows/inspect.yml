@@ -1,0 +1,33 @@
+name: Inspect Rosint (debug)
+
+on:
+  workflow_dispatch: {}  # запускается только вручную
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run inspection
+        run: python inspect_rosint.py > inspect_output.txt 2>&1 || true
+
+      - name: Show output in logs
+        run: cat inspect_output.txt
+
+      - name: Upload output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosint-inspect-output
+          path: inspect_output.txt
