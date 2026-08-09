@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Мониторинг новых постов Reddit-пользователя, уведомления в Telegram.
+Мониторинг новых постов Reddit-пользователя через Arctic Shift
+(arctic-shift.photon-reddit.com) — открытый архив Reddit-данных,
+не требует авторизации и не блочит GitHub Actions IP (в отличие от
+прямого reddit.com/*.json, который банит датацентровые IP).
 
-Источник: официальный Reddit JSON API (публичный, без авторизации нужен только
-корректный User-Agent, но лучше использовать OAuth client_id/secret, если он
-у тебя уже есть — так стабильнее и не банит по IP GitHub Actions).
-
-Состояние (какие посты уже видели) хранится в state.json и коммитится обратно
-в репозиторий Actions-раннером, чтобы между запусками (раз в 6 часов) не
-слать одно и то же повторно.
+Уведомления шлются в Telegram.
 """
 
 import json
@@ -23,9 +20,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-REDDIT_URL = f"https://old.reddit.com/user/{REDDIT_USERNAME}/submitted.json?limit=25"
-# Реалистичный browser-like UA + доп. заголовки часто пропускают там, где
-# дефолтный python-agent словит 403 с датацентровых IP (GitHub Actions).
+API_URL = (
+    f"https://arctic-shift.photon-reddit.com/api/posts/search"
+    f"?limit=100&sort=desc&author={REDDIT_USERNAME}"
+)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -40,25 +38,21 @@ def load_state():
 
 
 def save_state(state):
-    # держим последние 500 id, чтобы файл не рос бесконечно
     state["seen_ids"] = state["seen_ids"][-500:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def fetch_posts():
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    req = urllib.request.Request(REDDIT_URL, headers=headers)
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    req = urllib.request.Request(API_URL, headers=headers)
 
     last_error = None
+    payload = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(resp.read().decode("utf-8"))
             last_error = None
             break
         except urllib.error.HTTPError as e:
@@ -70,25 +64,39 @@ def fetch_posts():
         time.sleep(5)
 
     if last_error:
-        print(f"Error fetching reddit after retries: {last_error}", file=sys.stderr)
+        print(f"Error fetching Arctic Shift after retries: {last_error}", file=sys.stderr)
         sys.exit(1)
 
-    children = data.get("data", {}).get("children", [])
+    raw_posts = payload.get("data", [])
     posts = []
-    for child in children:
-        p = child.get("data", {})
+    for p in raw_posts:
         posts.append(
             {
                 "id": p.get("id"),
-                "title": p.get("title", "(без заголовка)"),
+                "title": p.get("title") or "(без заголовка)",
                 "subreddit": p.get("subreddit_name_prefixed", ""),
                 "url": "https://www.reddit.com" + p.get("permalink", ""),
+                "external_url": p.get("url"),
                 "created_utc": p.get("created_utc", 0),
-                "is_self": p.get("is_self", False),
-                "link_flair_text": p.get("link_flair_text"),
+                "selftext": (p.get("selftext") or "")[:300],
             }
         )
     return posts
+
+
+def escape_html(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_message(post):
+    text_block = f"\n\n{escape_html(post['selftext'])}" if post["selftext"] else ""
+    return (
+        f"🆕 Новый пост у <b>u/{REDDIT_USERNAME}</b>\n"
+        f"{post['subreddit']}\n\n"
+        f"<b>{escape_html(post['title'])}</b>"
+        f"{text_block}\n\n"
+        f"{post['url']}"
+    )
 
 
 def send_telegram(text):
@@ -112,31 +120,12 @@ def send_telegram(text):
         print(f"Telegram error: {e.code} {body}", file=sys.stderr)
 
 
-def format_message(post):
-    flair = f" [{post['link_flair_text']}]" if post.get("link_flair_text") else ""
-    return (
-        f"🆕 Новый пост у <b>u/{REDDIT_USERNAME}</b>{flair}\n"
-        f"{post['subreddit']}\n\n"
-        f"<b>{escape_html(post['title'])}</b>\n\n"
-        f"{post['url']}"
-    )
-
-
-def escape_html(s):
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def main():
     state = load_state()
     seen = set(state["seen_ids"])
 
     posts = fetch_posts()
-    # старые -> новые, чтобы уведомления в телеге шли в хронологическом порядке
-    posts.sort(key=lambda p: p["created_utc"])
+    posts.sort(key=lambda p: p["created_utc"])  # старые -> новые
 
     new_posts = [p for p in posts if p["id"] and p["id"] not in seen]
 
@@ -150,7 +139,7 @@ def main():
         send_telegram(format_message(post))
         seen.add(post["id"])
         state["seen_ids"].append(post["id"])
-        time.sleep(1)  # чтобы не упереться в rate limit телеги
+        time.sleep(1)
 
     save_state(state)
 
