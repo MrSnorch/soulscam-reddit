@@ -23,8 +23,13 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-REDDIT_URL = f"https://www.reddit.com/user/{REDDIT_USERNAME}/submitted.json?limit=25"
-USER_AGENT = f"python:reddit-post-monitor:v1.0 (by /u/{REDDIT_USERNAME}-watcher)"
+REDDIT_URL = f"https://old.reddit.com/user/{REDDIT_USERNAME}/submitted.json?limit=25"
+# Реалистичный browser-like UA + доп. заголовки часто пропускают там, где
+# дефолтный python-agent словит 403 с датацентровых IP (GitHub Actions).
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def load_state():
@@ -42,15 +47,30 @@ def save_state(state):
 
 
 def fetch_posts():
-    req = urllib.request.Request(REDDIT_URL, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        print(f"HTTP error fetching reddit: {e.code} {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error fetching reddit: {e}", file=sys.stderr)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(REDDIT_URL, headers=headers)
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            last_error = None
+            break
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code} {e.reason}"
+            print(f"Attempt {attempt + 1}: {last_error}", file=sys.stderr)
+        except Exception as e:
+            last_error = str(e)
+            print(f"Attempt {attempt + 1}: {last_error}", file=sys.stderr)
+        time.sleep(5)
+
+    if last_error:
+        print(f"Error fetching reddit after retries: {last_error}", file=sys.stderr)
         sys.exit(1)
 
     children = data.get("data", {}).get("children", [])
