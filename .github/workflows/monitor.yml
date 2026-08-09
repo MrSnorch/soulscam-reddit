@@ -37,7 +37,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          REDDIT_USERNAMES: "SoulboundMMO,futuraszn"
+          REDDIT_USERNAMES: "futuraszn,SoulboundMMO"
           RUN_DURATION_SECONDS: 21000   # ~5ч50м — оставляем запас до лимита джобы
           CHECK_INTERVAL_SECONDS: 300   # 5 минут
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
