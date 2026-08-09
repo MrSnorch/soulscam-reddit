@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import datetime
 import urllib.request
 import urllib.error
 
@@ -27,16 +28,12 @@ USERNAMES = [
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# GitHub self-retrigger — нужны, чтобы после 6 часов сразу запустить следующий джоб
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")  # "owner/repo", задаётся Actions автоматически
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
 
-RUN_DURATION_SECONDS = int(os.environ.get("RUN_DURATION_SECONDS", 6 * 60 * 60))  # 6 часов
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 5 * 60))  # 5 минут
+RUN_DURATION_SECONDS = int(os.environ.get("RUN_DURATION_SECONDS", 6 * 60 * 60))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 5 * 60))
 
-# Режим "только пометить текущие посты как виденные, не слать уведомления".
-# Полезно для самого первого запуска, чтобы не получить спам-рассылку всей
-# истории постов. Включается переменной SEED_ONLY=true.
 SEED_ONLY = os.environ.get("SEED_ONLY", "false").lower() in ("1", "true", "yes")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
@@ -44,6 +41,11 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+def log(msg):
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def load_state():
@@ -65,28 +67,24 @@ def save_state(state):
 
 
 def commit_state():
-    """Коммитит state.json в репозиторий прямо во время цикла (не только
-    в конце), чтобы падение джобы посреди 6-часового окна не приводило
-    к повторной рассылке уже отправленных уведомлений."""
     import subprocess
 
+    cwd = os.path.dirname(__file__) or "."
     try:
-        subprocess.run(["git", "add", "state.json"], check=True, cwd=os.path.dirname(__file__) or ".")
-        result = subprocess.run(
-            ["git", "diff", "--staged", "--quiet"],
-            cwd=os.path.dirname(__file__) or ".",
-        )
+        subprocess.run(["git", "add", "state.json"], check=True, cwd=cwd)
+        result = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=cwd)
         if result.returncode == 0:
-            return  # нечего коммитить
+            log("state.json без изменений, коммит не нужен.")
+            return
         subprocess.run(
             ["git", "commit", "-m", "chore: update seen posts state [skip ci]"],
             check=True,
-            cwd=os.path.dirname(__file__) or ".",
+            cwd=cwd,
         )
-        subprocess.run(["git", "push"], check=True, cwd=os.path.dirname(__file__) or ".")
-        print("state.json закоммичен.")
+        subprocess.run(["git", "push"], check=True, cwd=cwd)
+        log("state.json закоммичен и запушен.")
     except subprocess.CalledProcessError as e:
-        print(f"Не удалось закоммитить state.json: {e}", file=sys.stderr)
+        log(f"⚠ Не удалось закоммитить state.json: {e}")
 
 
 def fetch_posts(username):
@@ -107,14 +105,14 @@ def fetch_posts(username):
             break
         except urllib.error.HTTPError as e:
             last_error = f"HTTP {e.code} {e.reason}"
-            print(f"[{username}] Attempt {attempt + 1}: {last_error}", file=sys.stderr)
+            log(f"[{username}] Попытка {attempt + 1}/3 неудачна: {last_error}")
         except Exception as e:
             last_error = str(e)
-            print(f"[{username}] Attempt {attempt + 1}: {last_error}", file=sys.stderr)
+            log(f"[{username}] Попытка {attempt + 1}/3 неудачна: {last_error}")
         time.sleep(5)
 
     if last_error:
-        print(f"[{username}] Error fetching after retries: {last_error}", file=sys.stderr)
+        log(f"[{username}] ❌ Не удалось получить посты после 3 попыток: {last_error}")
         return []
 
     raw_posts = payload.get("data", [])
@@ -130,6 +128,7 @@ def fetch_posts(username):
                 "selftext": (p.get("selftext") or "")[:300],
             }
         )
+    log(f"[{username}] Получено {len(posts)} постов из Arctic Shift")
     return posts
 
 
@@ -166,7 +165,8 @@ def send_telegram(text):
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
-            return  # успех
+            log("✅ Сообщение отправлено в Telegram")
+            return
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             if e.code == 429:
@@ -174,40 +174,41 @@ def send_telegram(text):
                     retry_after = json.loads(body).get("parameters", {}).get("retry_after", 5)
                 except Exception:
                     retry_after = 5
-                print(f"Telegram 429, жду {retry_after}s и повторяю...", file=sys.stderr)
+                log(f"⏳ Telegram 429, жду {retry_after}s и повторяю... (попытка {attempt + 1}/5)")
                 time.sleep(retry_after + 1)
                 continue
-            print(f"Telegram error: {e.code} {body}", file=sys.stderr)
+            log(f"❌ Telegram error: {e.code} {body}")
             return
-    print("Telegram: не удалось отправить сообщение после нескольких попыток.", file=sys.stderr)
+    log("❌ Telegram: не удалось отправить сообщение после нескольких попыток.")
 
 
 def check_once(state):
-    """Один проход по всем юзерам. Возвращает число новых постов.
-    В режиме SEED_ONLY просто помечает все текущие посты как виденные,
-    без отправки уведомлений."""
+    """Один проход по всем юзерам. Возвращает число новых постов."""
     total_new = 0
     for username in USERNAMES:
         seen = set(state["by_user"].get(username, []))
+        log(f"[{username}] Проверяю... (уже известно постов: {len(seen)})")
         posts = fetch_posts(username)
 
         if SEED_ONLY:
             ids = [p["id"] for p in posts if p.get("id")]
             state["by_user"][username] = ids
-            print(f"[{username}] SEED_ONLY: помечено как виденные {len(ids)} постов")
+            log(f"[{username}] SEED_ONLY: помечено как виденные {len(ids)} постов")
             continue
 
         posts.sort(key=lambda p: p["created_utc"])
 
         new_posts = [p for p in posts if p["id"] and p["id"] not in seen]
         if not new_posts:
+            log(f"[{username}] Новых постов нет.")
             continue
 
-        print(f"[{username}] Найдено новых постов: {len(new_posts)}")
+        log(f"[{username}] 🆕 Найдено новых постов: {len(new_posts)}")
         total_new += len(new_posts)
 
         seen_list = state["by_user"].setdefault(username, [])
         for post in new_posts:
+            log(f"[{username}]   -> отправляю: {post['title'][:80]!r}")
             send_telegram(format_message(username, post))
             seen_list.append(post["id"])
             time.sleep(2)
@@ -217,11 +218,9 @@ def check_once(state):
 
 
 def trigger_next_run():
-    """Запускает следующий workflow_dispatch через GitHub API, чтобы
-    цепочка 6-часовых окон продолжалась без разрыва."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        print("GITHUB_TOKEN/GITHUB_REPOSITORY недоступны — пропускаю self-retrigger "
-              "(следующий запуск возьмёт на себя cron).", file=sys.stderr)
+        log("⚠ GITHUB_TOKEN/GITHUB_REPOSITORY недоступны — пропускаю self-retrigger "
+            "(следующий запуск возьмёт на себя cron).")
         return
 
     api_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/monitor.yml/dispatches"
@@ -238,52 +237,69 @@ def trigger_next_run():
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            print(f"Следующий запуск запущен: HTTP {resp.status}")
+            log(f"✅ Следующий запуск успешно запущен: HTTP {resp.status}")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        print(f"Не удалось запустить следующий джоб: {e.code} {body}", file=sys.stderr)
+        log(f"❌ Не удалось запустить следующий джоб: {e.code} {body}")
 
 
 def main():
     state = load_state()
 
+    log(f"Запуск скрипта. Юзеры: {', '.join(USERNAMES)}")
+    log(f"Режим: {'SEED_ONLY (без рассылки)' if SEED_ONLY else 'обычный мониторинг'}")
+
     if SEED_ONLY:
-        print(f"SEED_ONLY режим: помечаю текущие посты как виденные для {', '.join(USERNAMES)}")
         check_once(state)
         commit_state()
-        print("Готово. Обычный monitor.py теперь будет слать только новые посты.")
+        log("✅ SEED_ONLY завершён. Обычный запуск теперь будет слать только новые посты.")
         return
 
     start = time.monotonic()
     deadline = start + RUN_DURATION_SECONDS
+    end_time_str = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=RUN_DURATION_SECONDS)
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    print(
-        f"Старт цикла: {RUN_DURATION_SECONDS // 3600}ч, "
-        f"проверка каждые {CHECK_INTERVAL_SECONDS // 60} мин, "
-        f"юзеры: {', '.join(USERNAMES)}"
+    log(
+        f"Цикл рассчитан на {RUN_DURATION_SECONDS // 3600}ч "
+        f"{(RUN_DURATION_SECONDS % 3600) // 60}м, проверка каждые "
+        f"{CHECK_INTERVAL_SECONDS // 60} мин. Ожидаемое завершение окна: ~{end_time_str}"
     )
 
     iteration = 0
     while True:
         iteration += 1
         now = time.monotonic()
-        print(f"\n--- Проверка #{iteration} ({int(now - start)}s с начала) ---")
+        elapsed = int(now - start)
+        log(f"--- Проверка #{iteration} (прошло {elapsed // 60} мин {elapsed % 60} сек) ---")
+
         found = check_once(state)
         if found > 0:
+            log(f"Итого новых постов в этой проверке: {found}")
             commit_state()
+        else:
+            log("Новых постов не найдено ни у кого.")
 
         now = time.monotonic()
         remaining = deadline - now
         if remaining <= CHECK_INTERVAL_SECONDS:
-            # следующей полной проверки уже не влезет — выходим из цикла
             if remaining > 0:
-                print(f"До конца окна осталось {int(remaining)}s — завершаю цикл.")
+                log(f"До конца окна осталось {int(remaining)}s — завершаю цикл проверок.")
             break
 
+        next_check_str = (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=CHECK_INTERVAL_SECONDS)
+        ).strftime("%H:%M:%S UTC")
+        log(f"Сплю {CHECK_INTERVAL_SECONDS // 60} мин. Следующая проверка ~{next_check_str}")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
-    print("\n6-часовое окно почти закончилось. Запускаю следующий джоб...")
+    log(f"Цикл завершён. Всего проверок за этот запуск: {iteration}")
+    log("Запускаю следующий 6-часовой джоб...")
     trigger_next_run()
+    log("Скрипт завершает работу.")
 
 
 if __name__ == "__main__":
