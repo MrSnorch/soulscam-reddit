@@ -1,7 +1,12 @@
 name: Reddit Post Monitor
 
 on:
-  workflow_dispatch: {}   # запусти вручную один раз, чтобы стартовать цепочку
+  workflow_dispatch:
+    inputs:
+      seed_only:
+        description: "Только пометить текущие посты как виденные (без рассылки)"
+        type: boolean
+        default: false
   schedule:
     # подстраховка: если self-retrigger по какой-то причине не сработал,
     # раз в сутки cron всё равно перезапустит цепочку
@@ -40,6 +45,7 @@ jobs:
           REDDIT_USERNAMES: "futuraszn,SoulboundMMO"
           RUN_DURATION_SECONDS: 21000   # ~5ч50м — оставляем запас до лимита джобы
           CHECK_INTERVAL_SECONDS: 300   # 5 минут
+          SEED_ONLY: ${{ github.event.inputs.seed_only || 'false' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python monitor.py
 
