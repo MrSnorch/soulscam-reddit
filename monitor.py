@@ -34,6 +34,11 @@ GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")  # "owner/repo", зад�
 RUN_DURATION_SECONDS = int(os.environ.get("RUN_DURATION_SECONDS", 6 * 60 * 60))  # 6 часов
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 5 * 60))  # 5 минут
 
+# Режим "только пометить текущие посты как виденные, не слать уведомления".
+# Полезно для самого первого запуска, чтобы не получить спам-рассылку всей
+# истории постов. Включается переменной SEED_ONLY=true.
+SEED_ONLY = os.environ.get("SEED_ONLY", "false").lower() in ("1", "true", "yes")
+
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -153,23 +158,45 @@ def send_telegram(text):
             "disable_web_page_preview": False,
         }
     ).encode("utf-8")
-    req = urllib.request.Request(
-        api_url, data=payload, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"Telegram error: {e.code} {body}", file=sys.stderr)
+
+    for attempt in range(5):
+        req = urllib.request.Request(
+            api_url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+            return  # успех
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code == 429:
+                try:
+                    retry_after = json.loads(body).get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    retry_after = 5
+                print(f"Telegram 429, жду {retry_after}s и повторяю...", file=sys.stderr)
+                time.sleep(retry_after + 1)
+                continue
+            print(f"Telegram error: {e.code} {body}", file=sys.stderr)
+            return
+    print("Telegram: не удалось отправить сообщение после нескольких попыток.", file=sys.stderr)
 
 
 def check_once(state):
-    """Один проход по всем юзерам. Возвращает число новых постов."""
+    """Один проход по всем юзерам. Возвращает число новых постов.
+    В режиме SEED_ONLY просто помечает все текущие посты как виденные,
+    без отправки уведомлений."""
     total_new = 0
     for username in USERNAMES:
         seen = set(state["by_user"].get(username, []))
         posts = fetch_posts(username)
+
+        if SEED_ONLY:
+            ids = [p["id"] for p in posts if p.get("id")]
+            state["by_user"][username] = ids
+            print(f"[{username}] SEED_ONLY: помечено как виденные {len(ids)} постов")
+            continue
+
         posts.sort(key=lambda p: p["created_utc"])
 
         new_posts = [p for p in posts if p["id"] and p["id"] not in seen]
@@ -183,7 +210,7 @@ def check_once(state):
         for post in new_posts:
             send_telegram(format_message(username, post))
             seen_list.append(post["id"])
-            time.sleep(1)
+            time.sleep(2)
 
     save_state(state)
     return total_new
@@ -219,6 +246,14 @@ def trigger_next_run():
 
 def main():
     state = load_state()
+
+    if SEED_ONLY:
+        print(f"SEED_ONLY режим: помечаю текущие посты как виденные для {', '.join(USERNAMES)}")
+        check_once(state)
+        commit_state()
+        print("Готово. Обычный monitor.py теперь будет слать только новые посты.")
+        return
+
     start = time.monotonic()
     deadline = start + RUN_DURATION_SECONDS
 
